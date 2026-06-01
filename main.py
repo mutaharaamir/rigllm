@@ -7,6 +7,40 @@ from utils import *
 
 login(token='')
 
+nsamples = 128
+sparsity = 0.5
+seed = 42
+seqlen = 2048
+drop_fraction = 0.5 # the paper suggests 0.1/0.3/0.5
+num_epochs = 5   # how many times we see the whole batch
+update_schedule = 64
+model_name = "meta-llama/Llama-3.2-1B"
+
+wandb.init(
+    project="rigl-llm",
+    name="8b-50%-0.3-64-5",   # optional, auto-generated if omitted
+    config={
+        "sparsity_ratio": sparsity,
+        "seed": seed,
+        "seqlen": seqlen,
+        "nsamples": nsamples,
+        "drop_fraction": drop_fraction,
+        "update_schedule": "every 64 samples",
+        "num_epochs": num_epochs,
+        "model": model_name,
+    }
+)
+
+wandb.run.notes = f"Sparsity: {sparsity} | Drop Frac: {drop_fraction} | Schedule: {update_schedule} | Epochs: {num_epochs} | model: {model_name}"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16, # loads in 32-bit on cpu otherwise
+    device_map="cpu"
+)
+
 # todo: benchmark this against magnitude pruning to make sure it's the same
 def init_mask(model, sparsity=0.5, device='cuda', seed=67):
     torch.manual_seed(seed)
@@ -58,47 +92,6 @@ def update_mask(layer, drop_fraction=0.3):
         print(f'sparsity in {name}: {actual_sparsity}')
 
 
-nsamples = 128
-sparsity = 0.5
-seed = 42
-seqlen = 2048
-drop_fraction = 0.5 # the paper suggests 0.1/0.3/0.5
-num_epochs = 5   # how many times we see the whole batch
-update_schedule = 64
-
-wandb.init(
-    project="rigl-llm",
-    name="8b-50%-0.3-64-5",   # optional, auto-generated if omitted
-    config={
-        "sparsity_ratio": sparsity,
-        "seed": seed,
-        "seqlen": seqlen,
-        "nsamples": nsamples,
-        "drop_fraction": drop_fraction,
-        "update_schedule": "every 64 samples",
-        "num_epochs": num_epochs,
-        "model": "Llama-3.1-8B",
-    }
-)
-
-wandb.run.notes = f"Sparsity: {sparsity} | Drop Frac: {drop_fraction} | Schedule: {update_schedule} | Epochs: {num_epochs}"
-
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
-
-model = AutoModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-3.1-8B",
-    torch_dtype=torch.float16, # loads in 32-bit on cpu otherwise
-    device_map="cpu"
-)
-
-# i dont need to do this for every run
-# model.to('cuda')
-# ppl_before = eval_ppl(42, model, tokenizer)
-# print(ppl_before)
-# wandb.log({"ppl/perplexity before pruning": ppl_before})
-# model.to('cpu')
-
-
 def prune_rigl(model, tokenizer, device='cuda', sparsity=0.5, nsamples=128,
                seqlen=2048, seed=42, num_epochs=3, drop_fraction=0.3, update_schedule=64):
     """
@@ -145,7 +138,6 @@ def prune_rigl(model, tokenizer, device='cuda', sparsity=0.5, nsamples=128,
         attention_mask = attention_mask.to(device)
 
     current_inps = inps
-    current_outs = torch.zeros_like(current_inps)
     for layer_idx, layer in enumerate(layers):
         layer = layer.to(device)
         layer.zero_grad()
@@ -181,6 +173,7 @@ def prune_rigl(model, tokenizer, device='cuda', sparsity=0.5, nsamples=128,
         for i in range(num_epochs):
             print(f'Layer {layer_idx}, Epoch # {i}')
 
+            # layer.zero_grad() # this happens currently, maybe uncomment in the future
             layer.train() # make sure gradients are being tracked.
 
             print(f'5.2 Applying Masks. {time.perf_counter() - start:.2f}s')
@@ -189,9 +182,7 @@ def prune_rigl(model, tokenizer, device='cuda', sparsity=0.5, nsamples=128,
                     submodule.weight.data.copy_(dense_weights[name])      # restore dense mask
                     submodule.weight.data.mul_(submodule.mask)            # apply (updated) mask
 
-            # get layer outputs for masked layer
-            # NOTE: I CAN'T EVEN DO A BATCH SIZE OF 8 (ON THIS GPU AT LEAST) WITHOUT OOM-ING
-            # SO I'M JUST GOING TO DO THIS SAMPLE-WISE AND COMPUTE THE LOSS AND EVERYTHING INSIDE THE LOOP
+
             print(f'5.3 getting outputs from sparse layer and calculating reconstruction loss. {time.perf_counter() - start:.2f}s')
             running_loss = 0
             criterion = nn.MSELoss()
@@ -214,7 +205,6 @@ def prune_rigl(model, tokenizer, device='cuda', sparsity=0.5, nsamples=128,
                 loss.backward()
 
                 # update mask
-                update_schedule = 64 # update mask after every 64 batch runs
                 if (idx+1) % update_schedule == 0:
                     print('updating mask')
                     update_mask(layer, drop_fraction=drop_fraction)
@@ -261,6 +251,12 @@ def prune_rigl(model, tokenizer, device='cuda', sparsity=0.5, nsamples=128,
 
 prune_rigl(model, tokenizer, 'cuda', sparsity, nsamples, seqlen,
            seed, num_epochs, drop_fraction, update_schedule)
+
+
+# (re)apply all masks
+for name, module in model.named_modules():
+    if isinstance(module, nn.Linear) and hasattr(module, 'mask'):
+        module.weight.data.mul_(module.mask)
 
 # evaluate
 model.to('cuda')
